@@ -106,7 +106,7 @@ jobs:
           echo "VULKAN_SDK=${sdkPath}" >> $env:GITHUB_ENV
           echo "${sdkPath}\Bin" >> $env:GITHUB_PATH
 
-      - name: Build with Vulkan (static CRT, no OpenMP)
+      - name: Build with Vulkan (static CRT, no OpenMP, SSE2-only)
         shell: pwsh
         run: |
           # CMAKE_POLICY_DEFAULT_CMP0091=NEW is REQUIRED for CMAKE_MSVC_RUNTIME_LIBRARY
@@ -119,6 +119,16 @@ jobs:
           # cover vcomp — there is no static OpenMP on MSVC. whisper.cpp falls back to
           # its own threadpool, parallelism is preserved, and the main speed path is
           # Vulkan GPU anyway.
+          #
+          # GGML_AVX/AVX2/FMA/F16C/BMI2=OFF is REQUIRED for ARM64 Windows compatibility.
+          # By default ggml-cpu is compiled with /arch:AVX2 and emits AVX2/FMA/F16C/BMI2
+          # instructions. When this x64 binary runs under WoW64 x86_64 emulation on an
+          # ARM64 Windows host, those instructions crash the process with ACCESS_VIOLATION
+          # (0xC0000005) — WoW64's x64-on-arm64 emulator does not reliably support them.
+          # Compiling with SSE2-only ggml-cpu makes the binary run on every Windows x64
+          # target: native x64 (any age), x64 under WoW64 on ARM64 (all Windows versions),
+          # and ancient CPUs without AVX. The CPU path is slower, but Vulkan GPU is the
+          # primary compute path and is unaffected.
           cmake -B build -S . `
             -A x64 `
             -DCMAKE_BUILD_TYPE=Release `
@@ -126,6 +136,11 @@ jobs:
             -DGGML_VULKAN=ON `
             -DGGML_NATIVE=OFF `
             -DGGML_OPENMP=OFF `
+            -DGGML_AVX=OFF `
+            -DGGML_AVX2=OFF `
+            -DGGML_FMA=OFF `
+            -DGGML_F16C=OFF `
+            -DGGML_BMI2=OFF `
             -DBUILD_SHARED_LIBS=ON `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           cmake --build build --config Release --target whisper-cli
@@ -133,110 +148,3 @@ jobs:
       - name: Verify no VC++ redist dependencies
         shell: pwsh
         run: |
-          # Belt-and-suspenders: inspect EVERY binary we're about to ship and fail the
-          # build if anything imports MSVCP140 / VCRUNTIME140 (dynamic CRT) or VCOMP140
-          # (OpenMP runtime). These ship with VC++ redistributable and are NOT present
-          # on clean Windows installs — missing any of them = STATUS_DLL_NOT_FOUND at
-          # launch.
-          $dumpbin = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $dumpbin) { throw "dumpbin.exe not found — cannot verify, refusing to ship" }
-
-          $binaries = @()
-          $binaries += Get-Item build\bin\Release\whisper-cli.exe
-          $binaries += Get-ChildItem build\bin\Release\*.dll -ErrorAction SilentlyContinue
-          $binaries += Get-ChildItem build\src\Release\*.dll -ErrorAction SilentlyContinue
-          $binaries += Get-ChildItem build\ggml\src\Release\*.dll -ErrorAction SilentlyContinue
-          $binaries += Get-ChildItem build\ggml\src\ggml-vulkan\Release\*.dll -ErrorAction SilentlyContinue
-
-          $bad = @()
-          foreach ($bin in $binaries) {
-            $imports = & $dumpbin.FullName /imports $bin.FullName 2>&1 | Out-String
-            if ($imports -match 'MSVCP140\.dll|VCRUNTIME140(_1)?\.dll|VCOMP140\.dll') {
-              $match = [regex]::Matches($imports, 'MSVCP140\.dll|VCRUNTIME140(_1)?\.dll|VCOMP140\.dll') | ForEach-Object { $_.Value } | Sort-Object -Unique
-              $bad += "$($bin.Name): $($match -join ', ')"
-            }
-          }
-          if ($bad.Count -gt 0) {
-            Write-Host "VC++ redist dependencies found:"
-            $bad | ForEach-Object { Write-Host "  $_" }
-            throw "One or more binaries still depend on VC++ redistributable DLLs"
-          }
-          Write-Host "OK: no VC++ redist dependencies in any shipped binary"
-
-      - name: Package binaries
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path package -Force | Out-Null
-          Copy-Item build\bin\Release\whisper-cli.exe package\
-          Get-ChildItem build\bin\Release\*.dll | Copy-Item -Destination package\
-          Get-ChildItem build\src\Release\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination package\
-          Get-ChildItem build\ggml\src\Release\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination package\
-          Get-ChildItem build\ggml\src\ggml-vulkan\Release\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination package\
-
-          # Bundle x64 vulkan-1.dll loader. whisper-cli.exe is linked against it, and
-          # ARM64 Windows (running x64 under emulation) cannot load the native ARM64
-          # loader shipped with drivers. Try several locations:
-          #   1. Vulkan SDK install tree
-          #   2. C:\Windows\System32\vulkan-1.dll on the runner
-          #   3. Download VulkanRT components zip from LunarG and extract
-          $vulkanDll = $null
-          if ($env:VULKAN_SDK -and (Test-Path $env:VULKAN_SDK)) {
-            $vulkanDll = Get-ChildItem -Path $env:VULKAN_SDK -Recurse -Filter vulkan-1.dll -ErrorAction SilentlyContinue `
-              | Where-Object { $_.FullName -notmatch 'Lib32|x86|arm64' } `
-              | Select-Object -First 1
-          }
-          if (-not $vulkanDll -and (Test-Path "C:\Windows\System32\vulkan-1.dll")) {
-            $vulkanDll = Get-Item "C:\Windows\System32\vulkan-1.dll"
-          }
-          if (-not $vulkanDll) {
-            Write-Host "vulkan-1.dll not found locally — downloading VulkanRT..."
-            $ver = "1.4.304.1"
-            $rtUrl = "https://sdk.lunarg.com/sdk/download/${ver}/windows/VulkanRT-${ver}-Components.zip"
-            Invoke-WebRequest -Uri $rtUrl -OutFile VulkanRT.zip -ErrorAction SilentlyContinue
-            if (Test-Path VulkanRT.zip) {
-              Expand-Archive -Path VulkanRT.zip -DestinationPath VulkanRT -Force
-              $vulkanDll = Get-ChildItem -Path VulkanRT -Recurse -Filter vulkan-1.dll -ErrorAction SilentlyContinue `
-                | Where-Object { $_.FullName -match 'x64|amd64' -or $_.FullName -notmatch 'x86|Lib32|arm64' } `
-                | Select-Object -First 1
-            }
-          }
-          if (-not $vulkanDll) { throw "vulkan-1.dll could not be located (SDK, System32, or VulkanRT download)" }
-          Write-Host "Using vulkan-1.dll from: $($vulkanDll.FullName)"
-          Copy-Item $vulkanDll.FullName package\
-
-          Get-ChildItem package
-          Compress-Archive -Path package\* -DestinationPath whisper-bin-x64-windows.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: whisper-windows
-          path: whisper-bin-x64-windows.zip
-
-  # ─── Publish both artifacts as a GitHub release ───
-  publish-release:
-    needs: [build-macos, build-windows]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create or update release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.release_tag }}
-          name: ${{ github.event.inputs.release_tag }}
-          body: |
-            Pre-built `whisper-cli` binaries for Echo Desktop.
-
-            Built from [ggml-org/whisper.cpp@${{ github.event.inputs.whisper_version }}](https://github.com/ggml-org/whisper.cpp/releases/tag/${{ github.event.inputs.whisper_version }}).
-
-            - `whisper-bin-x64-windows.zip` — Windows x64, Vulkan GPU, static CRT, no VC++ redist required
-            - `whisper-bin-universal-macos.tar.gz` — macOS universal (arm64 + x86_64), Metal GPU (embedded shaders)
-          draft: false
-          prerelease: false
-          files: |
-            artifacts/whisper-macos/whisper-bin-universal-macos.tar.gz
-            artifacts/whisper-windows/whisper-bin-x64-windows.zip
